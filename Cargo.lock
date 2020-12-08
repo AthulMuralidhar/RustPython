@@ -1931,7 +1931,6 @@ dependencies = [
 name = "rustpython-parser"
 version = "0.1.2"
 dependencies = [
- "ahash 0.6.2",
  "hashbrown",
  "lalrpop",
  "lalrpop-util",
