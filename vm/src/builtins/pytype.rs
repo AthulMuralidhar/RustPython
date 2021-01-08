@@ -2,7 +2,7 @@ use crate::common::lock::{
     PyMappedRwLockReadGuard, PyRwLock, PyRwLockReadGuard, PyRwLockUpgradableReadGuard,
     PyRwLockWriteGuard,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 
 use super::classmethod::PyClassMethod;
@@ -133,7 +133,7 @@ impl PyType {
 
     pub fn get_attributes(&self) -> PyAttributes {
         // Gather all members here:
-        let mut attributes = PyAttributes::new();
+        let mut attributes = PyAttributes::default();
 
         for bc in self.iter_mro().rev() {
             for (name, value) in bc.attributes.read().iter() {
@@ -791,7 +791,7 @@ pub fn new(
     name: &str,
     base: PyTypeRef,
     bases: Vec<PyTypeRef>,
-    attrs: HashMap<String, PyObjectRef>,
+    attrs: PyAttributes,
     mut slots: PyTypeSlots,
 ) -> Result<PyTypeRef, String> {
     // Check for duplicates in bases.
