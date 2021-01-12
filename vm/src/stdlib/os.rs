@@ -2647,6 +2647,16 @@ mod nt {
         }
     }
 
+    #[pyfunction]
+    fn ctermid(){
+        // what is pyfunction?
+        // what is ctermid in the python os module?
+        // returns the filename associated with the controlling terminal of the process.
+        // could be tty, vt-100 etc
+        // what are the arguments this function should have?
+        // how is this implimented in cpython?
+    }
+
     pub(super) fn support_funcs(_vm: &VirtualMachine) -> Vec<SupportFunc> {
         Vec::new()
     }
