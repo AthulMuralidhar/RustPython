@@ -2647,6 +2647,17 @@ mod nt {
         }
     }
 
+    #[pyfunction]
+    fn ctermid(vm: &VirtualMachine) -> PyResult{
+        let ret = unsafe { libc::ctermid() };
+        if ret.is_null(){
+            Err(errno_err(vm))
+        } else {
+            let ret = unsafe { ffi::CStr::from_ptr(ret) }.to_str().unwrap();
+            Ok(vm.ctx.new_str(name))
+        }
+    }
+
     pub(super) fn support_funcs(_vm: &VirtualMachine) -> Vec<SupportFunc> {
         Vec::new()
     }
