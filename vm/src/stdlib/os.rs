@@ -2225,7 +2225,7 @@ mod posix {
 
     #[pyfunction]
     fn get_terminal_size(fd: OptionalArg<i32>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
-        let (columns, lines) = {
+        let (columns, lines) = libc::{
             #[cfg(unix)]
             {
                 nix::ioctl_read_bad!(winsz, libc::TIOCGWINSZ, libc::winsize);
