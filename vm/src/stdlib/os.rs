@@ -2230,7 +2230,7 @@ mod posix {
 
     #[pyfunction]
     fn get_terminal_size(fd: OptionalArg<i32>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
-        let (columns, lines) = libc::{
+        let (columns, lines) = {
             #[cfg(unix)]
             {
                 nix::ioctl_read_bad!(winsz, libc::TIOCGWINSZ, libc::winsize);
@@ -2278,6 +2278,20 @@ mod posix {
             let _ = nix::unistd::close(fd);
             e.into_pyexception(vm)
         })
+    }
+
+    extern "C" {
+        fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
+    }
+    #[pyfunction]
+    fn _ctermid(vm: &VirtualMachine) -> PyResult{
+        let returned = unsafe { ctermid(std::ptr::null_mut()) };
+        if returned.is_null(){
+            Err(errno_err(vm))
+        } else {
+            let ret = unsafe { ffi::CStr::from_ptr(ret) }.to_str().unwrap();
+            Ok(vm.ctx.new_str(name))
+        }
     }
 
     pub(super) fn support_funcs(vm: &VirtualMachine) -> Vec<SupportFunc> {
@@ -2652,16 +2666,6 @@ mod nt {
         }
     }
 
-    #[pyfunction]
-    fn ctermid(vm: &VirtualMachine) -> PyResult{
-        let ret = unsafe { libc::ctermid() };
-        if ret.is_null(){
-            Err(errno_err(vm))
-        } else {
-            let ret = unsafe { ffi::CStr::from_ptr(ret) }.to_str().unwrap();
-            Ok(vm.ctx.new_str(name))
-        }
-    }
 
     pub(super) fn support_funcs(_vm: &VirtualMachine) -> Vec<SupportFunc> {
         Vec::new()
