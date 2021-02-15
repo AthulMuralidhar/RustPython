@@ -7,20 +7,20 @@ use std::time::{Duration, SystemTime};
 use std::{env, fs};
 
 use crossbeam_utils::atomic::AtomicCell;
-use num_traits::ToPrimitive;
+use num_bigint::BigInt;
 
 use super::errno::errors;
 use crate::builtins::bytes::{PyBytes, PyBytesRef};
 use crate::builtins::dict::PyDictRef;
-use crate::builtins::int::{PyInt, PyIntRef};
+use crate::builtins::int::{self, PyIntRef};
 use crate::builtins::pystr::{PyStr, PyStrRef};
 use crate::builtins::pytype::PyTypeRef;
 use crate::builtins::set::PySet;
-use crate::builtins::tuple::PyTupleRef;
+use crate::builtins::tuple::{PyTuple, PyTupleRef};
 use crate::byteslike::PyBytesLike;
 use crate::common::lock::PyRwLock;
 use crate::exceptions::{IntoPyException, PyBaseExceptionRef};
-use crate::function::{FuncArgs, IntoPyNativeFunc, OptionalArg};
+use crate::function::{ArgumentError, FromArgs, FuncArgs, IntoPyNativeFunc, OptionalArg};
 use crate::pyobject::{
     BorrowValue, Either, IntoPyObject, ItemProtocol, PyObjectRef, PyRef, PyResult,
     PyStructSequence, PyValue, StaticType, TryFromObject, TypeProtocol,
@@ -162,7 +162,7 @@ fn make_path<'a>(
     path: &'a PyPathLike,
     dir_fd: &DirFd,
 ) -> PyResult<&'a ffi::OsStr> {
-    if dir_fd.dir_fd.is_some() {
+    if dir_fd.0.is_some() {
         Err(vm.new_os_error("dir_fd not supported yet".to_owned()))
     } else {
         Ok(path.path.as_os_str())
@@ -187,20 +187,20 @@ impl IntoPyException for &'_ io::Error {
                 | Some(errors::EALREADY)
                 | Some(errors::EWOULDBLOCK)
                 | Some(errors::EINPROGRESS) => vm.ctx.exceptions.blocking_io_error.clone(),
+                Some(errors::ESRCH) => vm.ctx.exceptions.process_lookup_error.clone(),
                 _ => vm.ctx.exceptions.os_error.clone(),
             },
         };
-        let os_error = vm.new_exception_msg(exc_type, self.to_string());
         let errno = self.raw_os_error().into_pyobject(vm);
-        vm.set_attr(os_error.as_object(), "errno", errno).unwrap();
-        os_error
+        let msg = vm.ctx.new_str(self.to_string());
+        vm.new_exception(exc_type, vec![errno, msg])
     }
 }
 
 #[cfg(unix)]
 impl IntoPyException for nix::Error {
     fn into_pyexception(self, vm: &VirtualMachine) -> PyBaseExceptionRef {
-        let nix_error = match self {
+        match self {
             nix::Error::InvalidPath => {
                 let exc_type = vm.ctx.exceptions.file_not_found_error.clone();
                 vm.new_exception_msg(exc_type, self.to_string())
@@ -212,16 +212,15 @@ impl IntoPyException for nix::Error {
             nix::Error::UnsupportedOperation => vm.new_runtime_error(self.to_string()),
             nix::Error::Sys(errno) => {
                 let exc_type = posix::convert_nix_errno(vm, errno);
-                vm.new_exception_msg(exc_type, self.to_string())
+                vm.new_exception(
+                    exc_type,
+                    vec![
+                        vm.ctx.new_int(errno as i32),
+                        vm.ctx.new_str(self.to_string()),
+                    ],
+                )
             }
-        };
-
-        if let nix::Error::Sys(errno) = self {
-            vm.set_attr(nix_error.as_object(), "errno", vm.ctx.new_int(errno as i32))
-                .unwrap();
         }
-
-        nix_error
     }
 }
 
@@ -238,17 +237,33 @@ pub struct TargetIsDirectory {
     target_is_directory: bool,
 }
 
-#[derive(FromArgs, Default)]
-pub struct DirFd {
-    #[pyarg(named, default)]
-    dir_fd: Option<PyIntRef>,
+// TODO: we can have a const AVAIL: bool const generic argument once min_const_generics to mimic
+// CPython's dir_fd_unavailable
+#[derive(Default)]
+pub struct DirFd(Option<i32>);
+
+impl FromArgs for DirFd {
+    fn from_args(vm: &VirtualMachine, args: &mut FuncArgs) -> Result<Self, ArgumentError> {
+        let fd = match args.take_keyword("dir_fd") {
+            Some(o) if vm.is_none(&o) => None,
+            Some(o) => {
+                let fd = vm.to_index_opt(o.clone()).unwrap_or_else(|| {
+                    Err(vm.new_type_error(format!(
+                        "argument should be integer or None, not {}",
+                        o.class().name
+                    )))
+                })?;
+                let fd = int::try_to_primitive(fd.borrow_value(), vm)?;
+                Some(fd)
+            }
+            None => None,
+        };
+        Ok(Self(fd))
+    }
 }
 
 #[derive(FromArgs)]
-struct FollowSymlinks {
-    #[pyarg(named, default = "true")]
-    follow_symlinks: bool,
-}
+struct FollowSymlinks(#[pyarg(named, name = "follow_symlinks", default = "true")] bool);
 
 #[cfg(unix)]
 use posix::bytes_as_osstr;
@@ -284,7 +299,7 @@ fn os_unimpl<T>(func: &str, vm: &VirtualMachine) -> PyResult<T> {
     Err(vm.new_os_error(format!("{} is not supported on this platform", func)))
 }
 
-#[pymodule]
+#[pymodule(name = "os")]
 mod _os {
     use super::OpenFlags;
     use super::*;
@@ -294,6 +309,9 @@ mod _os {
         O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
         SEEK_SET,
     };
+    #[cfg(not(target_os = "windows"))]
+    #[pyattr]
+    use libc::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
     #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "linux"))]
     #[pyattr]
     use libc::{SEEK_DATA, SEEK_HOLE};
@@ -320,12 +338,9 @@ mod _os {
         name: PyPathLike,
         flags: OpenFlags,
         _mode: OptionalArg<PyIntRef>,
-        dir_fd: OptionalArg<PyIntRef>,
+        dir_fd: DirFd,
         vm: &VirtualMachine,
     ) -> PyResult<i64> {
-        let dir_fd = DirFd {
-            dir_fd: dir_fd.into_option(),
-        };
         let fname = make_path(vm, &name, &dir_fd)?;
         if osstr_contains_nul(fname) {
             return Err(vm.new_value_error("embedded null character".to_owned()));
@@ -590,14 +605,13 @@ mod _os {
             self.mode.process_path(self.entry.path(), vm)
         }
 
-        #[allow(clippy::match_bool)]
         fn perform_on_metadata(
             &self,
             follow_symlinks: FollowSymlinks,
             action: fn(fs::Metadata) -> bool,
             vm: &VirtualMachine,
         ) -> PyResult<bool> {
-            let meta = fs_metadata(self.entry.path(), follow_symlinks.follow_symlinks)
+            let meta = fs_metadata(self.entry.path(), follow_symlinks.0)
                 .map_err(|err| err.into_pyexception(vm))?;
             Ok(action(meta))
         }
@@ -636,7 +650,7 @@ mod _os {
             follow_symlinks: FollowSymlinks,
             vm: &VirtualMachine,
         ) -> PyResult {
-            super::platform::stat(
+            stat(
                 Either::A(PyPathLike {
                     path: self.entry.path(),
                     mode: OutputMode::String,
@@ -645,6 +659,11 @@ mod _os {
                 follow_symlinks,
                 vm,
             )
+        }
+
+        #[pymethod(magic)]
+        fn fspath(&self, vm: &VirtualMachine) -> PyResult {
+            self.path(vm)
         }
     }
 
@@ -724,7 +743,7 @@ mod _os {
     #[pyattr]
     #[pyclass(module = "os", name = "stat_result")]
     #[derive(Debug, PyStructSequence)]
-    pub(super) struct StatResult {
+    struct StatResult {
         pub st_mode: u32,
         pub st_ino: u64,
         pub st_dev: u64,
@@ -732,43 +751,173 @@ mod _os {
         pub st_uid: u32,
         pub st_gid: u32,
         pub st_size: u64,
+        // TODO: unnamed structsequence fields
+        pub __st_atime_int: BigInt,
+        pub __st_mtime_int: BigInt,
+        pub __st_ctime_int: BigInt,
         pub st_atime: f64,
         pub st_mtime: f64,
         pub st_ctime: f64,
+        pub st_atime_ns: BigInt,
+        pub st_mtime_ns: BigInt,
+        pub st_ctime_ns: BigInt,
     }
 
     #[pyimpl(with(PyStructSequence))]
     impl StatResult {
-        pub(super) fn into_obj(self, vm: &VirtualMachine) -> PyObjectRef {
+        fn into_obj(self, vm: &VirtualMachine) -> PyObjectRef {
             self.into_struct_sequence(vm).unwrap().into_object()
+        }
+
+        fn from_metadata(meta: fs::Metadata) -> io::Result<Self> {
+            let (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, ctime);
+            #[cfg(windows)]
+            {
+                ctime = meta.created()?;
+                st_ino = 0; // TODO: Not implemented in std::os::windows::fs::MetadataExt.
+                st_dev = 0; // TODO: Not implemented in std::os::windows::fs::MetadataExt.
+                st_nlink = 0; // TODO: Not implemented in std::os::windows::fs::MetadataExt.
+                st_uid = 0; // 0 on windows
+                st_gid = 0; // 0 on windows
+            }
+            #[cfg(unix)]
+            {
+                #[cfg(target_os = "android")]
+                use std::os::android::fs::MetadataExt;
+                #[cfg(target_os = "linux")]
+                use std::os::linux::fs::MetadataExt;
+                #[cfg(target_os = "macos")]
+                use std::os::macos::fs::MetadataExt;
+                #[cfg(target_os = "openbsd")]
+                use std::os::openbsd::fs::MetadataExt;
+                #[cfg(target_os = "redox")]
+                use std::os::redox::fs::MetadataExt;
+
+                // TODO: figure out a better way to do this, SystemTime is just a wrapper over timespec
+                ctime = {
+                    let (ctime, ctime_ns) = (meta.st_ctime(), meta.st_ctime_nsec());
+                    let dur = std::time::Duration::new(ctime.abs() as _, ctime_ns as _);
+                    if ctime < 0 {
+                        SystemTime::UNIX_EPOCH - dur
+                    } else {
+                        SystemTime::UNIX_EPOCH + dur
+                    }
+                };
+                st_mode = meta.st_mode();
+                st_ino = meta.st_ino();
+                st_dev = meta.st_dev();
+                st_nlink = meta.st_nlink();
+                st_uid = meta.st_uid();
+                st_gid = meta.st_gid();
+            }
+            #[cfg(target_os = "wasi")]
+            {
+                // XXX: currently meta.created() returns filestat_t.ctim, which is changetime. That
+                // might change in the future and meta.created() might return an error
+                ctime = meta.created()?;
+
+                // TODO: wasi::MetadataExt once stable
+                // use std::os::wasi::fs::MetadataExt;
+                // st_ino = meta.ino();
+                // st_dev = meta.dev();
+                // st_nlink = meta.nlink();
+                st_ino = 0;
+                st_dev = 0;
+                st_nlink = 0;
+
+                st_uid = 0;
+                st_gid = 0;
+            }
+            #[cfg(not(unix))]
+            {
+                // Based on CPython fileutils.c' attributes_to_mode
+                st_mode = {
+                    const S_IFDIR: u32 = 0o040000;
+                    const S_IFREG: u32 = 0o100000;
+                    let mut m: u32 = 0;
+                    if meta.is_dir() {
+                        m |= S_IFDIR | 0o111; /* IFEXEC for user,group,other */
+                    } else {
+                        m |= S_IFREG;
+                    }
+                    if meta.permissions().readonly() {
+                        m |= 0o444;
+                    } else {
+                        m |= 0o666;
+                    }
+                    m
+                };
+            }
+
+            let accessed = meta.accessed()?;
+            let modified = meta.modified()?;
+            Ok(StatResult {
+                st_mode,
+                st_ino,
+                st_dev,
+                st_nlink,
+                st_uid,
+                st_gid,
+                st_size: meta.len(),
+                __st_atime_int: int_seconds_epoch(accessed),
+                __st_mtime_int: int_seconds_epoch(modified),
+                __st_ctime_int: int_seconds_epoch(ctime),
+                st_atime: to_seconds_from_unix_epoch(accessed),
+                st_mtime: to_seconds_from_unix_epoch(modified),
+                st_ctime: to_seconds_from_unix_epoch(ctime),
+                st_atime_ns: to_nanoseconds_epoch(accessed),
+                st_mtime_ns: to_nanoseconds_epoch(modified),
+                st_ctime_ns: to_nanoseconds_epoch(ctime),
+            })
         }
     }
 
     #[pyfunction]
+    fn stat(
+        file: Either<PyPathLike, i64>,
+        dir_fd: super::DirFd,
+        follow_symlinks: FollowSymlinks,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        let meta = match file {
+            Either::A(path) => fs_metadata(make_path(vm, &path, &dir_fd)?, follow_symlinks.0),
+            Either::B(fno) => {
+                let file = rust_file(fno);
+                let res = file.metadata();
+                raw_file_number(file);
+                res
+            }
+        };
+        meta.and_then(StatResult::from_metadata)
+            .map(|stat| stat.into_obj(vm))
+            .map_err(|err| err.into_pyexception(vm))
+    }
+
+    #[pyfunction]
     fn lstat(file: Either<PyPathLike, i64>, dir_fd: DirFd, vm: &VirtualMachine) -> PyResult {
-        super::platform::stat(
-            file,
-            dir_fd,
-            FollowSymlinks {
-                follow_symlinks: false,
-            },
-            vm,
-        )
+        stat(file, dir_fd, FollowSymlinks(false), vm)
+    }
+
+    fn curdir_inner(vm: &VirtualMachine) -> PyResult<PathBuf> {
+        // getcwd (should) return FileNotFoundError if cwd is invalid; on wasi, we never have a
+        // valid cwd ;)
+        let res = if cfg!(target_os = "wasi") {
+            Err(io::ErrorKind::NotFound.into())
+        } else {
+            env::current_dir()
+        };
+
+        res.map_err(|err| err.into_pyexception(vm))
     }
 
     #[pyfunction]
-    fn getcwd(vm: &VirtualMachine) -> PyResult<String> {
-        Ok(env::current_dir()
-            .map_err(|err| err.into_pyexception(vm))?
-            .as_path()
-            .to_str()
-            .unwrap()
-            .to_owned())
+    fn getcwd(vm: &VirtualMachine) -> PyResult {
+        OutputMode::String.process_path(curdir_inner(vm)?, vm)
     }
 
     #[pyfunction]
-    fn getcwdb(vm: &VirtualMachine) -> PyResult<Vec<u8>> {
-        Ok(getcwd(vm)?.into_bytes().to_vec())
+    fn getcwdb(vm: &VirtualMachine) -> PyResult {
+        OutputMode::Bytes.process_path(curdir_inner(vm)?, vm)
     }
 
     #[pyfunction]
@@ -870,41 +1019,62 @@ mod _os {
         #[pyarg(named, default)]
         ns: Option<PyTupleRef>,
         #[pyarg(flatten)]
-        _dir_fd: DirFd,
+        dir_fd: DirFd,
         #[pyarg(flatten)]
-        _follow_symlinks: FollowSymlinks,
+        follow_symlinks: FollowSymlinks,
     }
 
     #[cfg(not(target_os = "wasi"))]
     #[pyfunction]
     fn utime(args: UtimeArgs, vm: &VirtualMachine) -> PyResult<()> {
-        let parse_tup = |tup: PyTupleRef| -> Option<(i64, i64)> {
+        let parse_tup = |tup: &PyTuple| -> Option<(PyObjectRef, PyObjectRef)> {
             let tup = tup.borrow_value();
             if tup.len() != 2 {
-                return None;
+                None
+            } else {
+                Some((tup[0].clone(), tup[1].clone()))
             }
-            let i = |e: &PyObjectRef| e.clone().downcast::<PyInt>().ok()?.borrow_value().to_i64();
-            Some((i(&tup[0])?, i(&tup[1])?))
         };
         let (acc, modif) = match (args.times, args.ns) {
-            (Some(t), None) => parse_tup(t).ok_or_else(|| {
-                vm.new_type_error(
-                    "utime: 'times' must be either a tuple of two ints or None".to_owned(),
+            (Some(t), None) => {
+                let (a, m) = parse_tup(&t).ok_or_else(|| {
+                    vm.new_type_error(
+                        "utime: 'times' must be either a tuple of two ints or None".to_owned(),
+                    )
+                })?;
+                (
+                    Duration::try_from_object(vm, a)?,
+                    Duration::try_from_object(vm, m)?,
                 )
-            })?,
+            }
             (None, Some(ns)) => {
-                let (a, m) = parse_tup(ns).ok_or_else(|| {
+                let (a, m) = parse_tup(&ns).ok_or_else(|| {
                     vm.new_type_error("utime: 'ns' must be a tuple of two ints".to_owned())
                 })?;
+                let ns_in_sec = vm.ctx.new_int(1_000_000_000);
+                let ns_to_dur = |obj: PyObjectRef| {
+                    let divmod = vm._divmod(&obj, &ns_in_sec)?;
+                    let (div, rem) =
+                        divmod
+                            .payload::<PyTuple>()
+                            .and_then(parse_tup)
+                            .ok_or_else(|| {
+                                vm.new_type_error(format!(
+                                    "{}.__divmod__() must return a 2-tuple, not {}",
+                                    obj.class().name,
+                                    divmod.class().name
+                                ))
+                            })?;
+                    let secs = int::try_to_primitive(vm.to_index(&div)?.borrow_value(), vm)?;
+                    let ns = int::try_to_primitive(vm.to_index(&rem)?.borrow_value(), vm)?;
+                    Ok(Duration::new(secs, ns))
+                };
                 // TODO: do validation to make sure this doesn't.. underflow?
-                (a / 1_000_000_000, m / 1_000_000_000)
+                (ns_to_dur(a)?, ns_to_dur(m)?)
             }
             (None, None) => {
                 let now = SystemTime::now();
-                let now = now
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or_else(|e| -(e.duration().as_secs() as i64));
+                let now = now.duration_since(SystemTime::UNIX_EPOCH).unwrap();
                 (now, now)
             }
             (Some(_), Some(_)) => {
@@ -913,7 +1083,86 @@ mod _os {
                 ))
             }
         };
-        utime::set_file_times(&args.path.path, acc, modif).map_err(|err| err.into_pyexception(vm))
+        utime_impl(
+            args.path.as_ref(),
+            acc,
+            modif,
+            args.dir_fd,
+            args.follow_symlinks,
+            vm,
+        )
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn utime_impl(
+        path: &Path,
+        acc: Duration,
+        modif: Duration,
+        _dir_fd: DirFd,
+        _follow_symlinks: FollowSymlinks,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        #[cfg(unix)]
+        {
+            #[cfg(not(target_os = "redox"))]
+            {
+                nix::sys::stat::utimensat(
+                    _dir_fd.0,
+                    path,
+                    &acc.into(),
+                    &modif.into(),
+                    if _follow_symlinks.0 {
+                        nix::sys::stat::UtimensatFlags::FollowSymlink
+                    } else {
+                        nix::sys::stat::UtimensatFlags::NoFollowSymlink
+                    },
+                )
+                .map_err(|err| err.into_pyexception(vm))
+            }
+            #[cfg(target_os = "redox")]
+            {
+                let tv = |d: Duration| libc::timeval {
+                    tv_sec: d.as_secs() as _,
+                    tv_usec: d.as_micros() as _,
+                };
+                nix::sys::stat::utimes(path, &tv(acc).into(), &tv(modif).into())
+                    .map_err(|err| err.into_pyexception(vm))
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::windows::prelude::*;
+            use winapi::shared::minwindef::{DWORD, FILETIME};
+            use winapi::um::fileapi::SetFileTime;
+
+            let ft = |d: Duration| {
+                let intervals =
+                    ((d.as_secs() as i64 + 11644473600) * 10_000_000) + (d.as_nanos() as i64 / 100);
+                FILETIME {
+                    dwLowDateTime: intervals as DWORD,
+                    dwHighDateTime: (intervals >> 32) as DWORD,
+                }
+            };
+
+            let acc = ft(acc);
+            let modif = ft(modif);
+
+            let f = OpenOptions::new()
+                .write(true)
+                .custom_flags(winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .map_err(|err| err.into_pyexception(vm))?;
+
+            let ret =
+                unsafe { SetFileTime(f.as_raw_handle() as _, std::ptr::null(), &acc, &modif) };
+
+            if ret == 0 {
+                Err(io::Error::last_os_error().into_pyexception(vm))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[pyfunction]
@@ -985,27 +1234,20 @@ mod _os {
             SupportFunc::new(vm, "replace", rename, Some(false), Some(false), None), // TODO: Fix replace
             SupportFunc::new(vm, "rmdir", rmdir, Some(false), Some(false), None),
             SupportFunc::new(vm, "scandir", scandir, Some(false), None, None),
-            SupportFunc::new(
-                vm,
-                "stat",
-                platform::stat,
-                Some(false),
-                Some(false),
-                Some(false),
-            ),
-            SupportFunc::new(
-                vm,
-                "fstat",
-                platform::stat,
-                Some(false),
-                Some(false),
-                Some(false),
-            ),
+            SupportFunc::new(vm, "stat", stat, Some(false), Some(false), Some(false)),
+            SupportFunc::new(vm, "fstat", stat, Some(false), Some(false), Some(false)),
             SupportFunc::new(vm, "symlink", platform::symlink, None, Some(false), None),
             // truncate Some None None
             SupportFunc::new(vm, "unlink", remove, Some(false), Some(false), None),
             #[cfg(not(target_os = "wasi"))]
-            SupportFunc::new(vm, "utime", utime, Some(false), Some(false), Some(false)),
+            SupportFunc::new(
+                vm,
+                "utime",
+                utime,
+                Some(false),
+                Some(cfg!(all(unix, not(target_os = "redox")))),
+                Some(cfg!(all(unix, not(target_os = "redox")))),
+            ),
         ]);
         supports
     }
@@ -1090,15 +1332,24 @@ pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 }
 pub(crate) use _os::open;
 
-// Copied code from Duration::as_secs_f64 as it's still unstable
-fn duration_as_secs_f64(duration: Duration) -> f64 {
-    (duration.as_secs() as f64) + f64::from(duration.subsec_nanos()) / 1_000_000_000_f64
-}
-
 fn to_seconds_from_unix_epoch(sys_time: SystemTime) -> f64 {
     match sys_time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration_as_secs_f64(duration),
-        Err(err) => -duration_as_secs_f64(err.duration()),
+        Ok(duration) => duration.as_secs_f64(),
+        Err(err) => -err.duration().as_secs_f64(),
+    }
+}
+
+fn to_nanoseconds_epoch(sys_time: SystemTime) -> BigInt {
+    match sys_time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => BigInt::from(duration.as_nanos()),
+        Err(err) => -BigInt::from(err.duration().as_nanos()),
+    }
+}
+
+fn int_seconds_epoch(sys_time: SystemTime) -> BigInt {
+    match sys_time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => BigInt::from(duration.as_secs()),
+        Err(err) => -BigInt::from(err.duration().as_secs()),
     }
 }
 
@@ -1111,7 +1362,7 @@ mod posix {
     use crate::builtins::list::PyListRef;
     use crate::pyobject::PyIterable;
     use bitflags::bitflags;
-    use nix::errno::Errno;
+    use nix::errno::{errno, Errno};
     use nix::unistd::{self, Gid, Pid, Uid};
     use std::convert::TryFrom;
     pub(super) use std::os::unix::fs::OpenOptionsExt;
@@ -1334,62 +1585,6 @@ mod posix {
         environ
     }
 
-    fn to_seconds_from_nanos(secs: i64, nanos: i64) -> f64 {
-        let duration = Duration::new(secs as u64, nanos as u32);
-        duration_as_secs_f64(duration)
-    }
-
-    #[pyfunction]
-    pub(super) fn stat(
-        file: Either<PyPathLike, i64>,
-        dir_fd: super::DirFd,
-        follow_symlinks: FollowSymlinks,
-        vm: &VirtualMachine,
-    ) -> PyResult {
-        #[cfg(target_os = "android")]
-        use std::os::android::fs::MetadataExt;
-        #[cfg(target_os = "linux")]
-        use std::os::linux::fs::MetadataExt;
-        #[cfg(target_os = "macos")]
-        use std::os::macos::fs::MetadataExt;
-        #[cfg(target_os = "openbsd")]
-        use std::os::openbsd::fs::MetadataExt;
-        #[cfg(target_os = "redox")]
-        use std::os::redox::fs::MetadataExt;
-
-        let meta = match file {
-            Either::A(path) => fs_metadata(
-                make_path(vm, &path, &dir_fd)?,
-                follow_symlinks.follow_symlinks,
-            ),
-            Either::B(fno) => {
-                let file = rust_file(fno);
-                let res = file.metadata();
-                raw_file_number(file);
-                res
-            }
-        };
-        let get_stats = move || -> io::Result<PyObjectRef> {
-            let meta = meta?;
-
-            Ok(super::_os::StatResult {
-                st_mode: meta.st_mode(),
-                st_ino: meta.st_ino(),
-                st_dev: meta.st_dev(),
-                st_nlink: meta.st_nlink(),
-                st_uid: meta.st_uid(),
-                st_gid: meta.st_gid(),
-                st_size: meta.st_size(),
-                st_atime: to_seconds_from_unix_epoch(meta.accessed()?),
-                st_mtime: to_seconds_from_unix_epoch(meta.modified()?),
-                st_ctime: to_seconds_from_nanos(meta.st_ctime(), meta.st_ctime_nsec()),
-            }
-            .into_obj(vm))
-        };
-
-        get_stats().map_err(|err| err.into_pyexception(vm))
-    }
-
     #[pyfunction]
     pub(super) fn symlink(
         src: PyPathLike,
@@ -1439,24 +1634,19 @@ mod posix {
             return Err(vm.new_os_error(String::from("Specified gid is not valid.")));
         };
 
-        let flag = if follow_symlinks.follow_symlinks {
+        let flag = if follow_symlinks.0 {
             nix::unistd::FchownatFlags::FollowSymlink
         } else {
             nix::unistd::FchownatFlags::NoFollowSymlink
         };
 
-        let dir_fd: Option<std::os::unix::io::RawFd> = match dir_fd.dir_fd {
-            Some(int_ref) => Some(i32::try_from_object(&vm, int_ref.as_object().clone())?),
-            None => None,
-        };
-
         match path {
-            Either::A(p) => nix::unistd::fchownat(dir_fd, p.path.as_os_str(), uid, gid, flag),
+            Either::A(p) => nix::unistd::fchownat(dir_fd.0, p.path.as_os_str(), uid, gid, flag),
             Either::B(fd) => {
                 let path = fs::read_link(format!("/proc/self/fd/{}", fd)).map_err(|_| {
                     vm.new_os_error(String::from("Cannot find path for specified fd"))
                 })?;
-                nix::unistd::fchownat(dir_fd, &path, uid, gid, flag)
+                nix::unistd::fchownat(dir_fd.0, &path, uid, gid, flag)
             }
         }
         .map_err(|err| err.into_pyexception(vm))
@@ -1469,10 +1659,8 @@ mod posix {
             Either::A(path),
             uid,
             gid,
-            DirFd { dir_fd: None },
-            FollowSymlinks {
-                follow_symlinks: false,
-            },
+            DirFd(None),
+            FollowSymlinks(false),
             vm,
         )
     }
@@ -1484,10 +1672,8 @@ mod posix {
             Either::B(fd),
             uid,
             gid,
-            DirFd { dir_fd: None },
-            FollowSymlinks {
-                follow_symlinks: true,
-            },
+            DirFd(None),
+            FollowSymlinks(true),
             vm,
         )
     }
@@ -1602,7 +1788,7 @@ mod posix {
         let path = make_path(vm, &path, &dir_fd)?;
         let body = move || {
             use std::os::unix::fs::PermissionsExt;
-            let meta = fs_metadata(path, follow_symlinks.follow_symlinks)?;
+            let meta = fs_metadata(path, follow_symlinks.0)?;
             let mut permissions = meta.permissions();
             permissions.set_mode(mode);
             fs::set_permissions(path, permissions)
@@ -2295,6 +2481,86 @@ mod posix {
             SupportFunc::new(vm, "execv", execv, None, None, None),
         ]
     }
+
+    /// Return a string containing the name of the user logged in on the
+    /// controlling terminal of the process.
+    ///
+    /// Exceptions:
+    ///
+    /// - `OSError`: Raised if login name could not be determined (`getlogin()`
+    ///   returned a null pointer).
+    /// - `UnicodeDecodeError`: Raised if login name contained invalid UTF-8 bytes.
+    #[pyfunction]
+    fn getlogin(vm: &VirtualMachine) -> PyResult<String> {
+        // Get a pointer to the login name string. The string is statically
+        // allocated and might be overwritten on subsequent calls to this
+        // function or to `cuserid()`. See man getlogin(3) for more information.
+        let ptr = unsafe { libc::getlogin() };
+        if ptr.is_null() {
+            return Err(vm.new_os_error("unable to determine login name".to_owned()));
+        }
+        let slice = unsafe { ffi::CStr::from_ptr(ptr) };
+        slice
+            .to_str()
+            .map(|s| s.to_owned())
+            .map_err(|e| vm.new_unicode_decode_error(format!("unable to decode login name: {}", e)))
+    }
+
+    // cfg from nix
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "openbsd"
+    ))]
+    #[pyfunction]
+    fn getgrouplist(user: PyStrRef, group: u32, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let user = ffi::CString::new(user.borrow_value()).unwrap();
+        let gid = Gid::from_raw(group);
+        let group_ids = unistd::getgrouplist(&user, gid).map_err(|err| err.into_pyexception(vm))?;
+        Ok(vm.ctx.new_list(
+            group_ids
+                .into_iter()
+                .map(|gid| vm.ctx.new_int(gid.as_raw()))
+                .collect(),
+        ))
+    }
+
+    cfg_if::cfg_if! {
+        if #[cfg(all(target_os = "linux", target_env = "gnu"))] {
+            type PriorityWhichType = libc::__priority_which_t;
+        } else {
+            type PriorityWhichType = libc::c_int;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[pyfunction]
+    fn getpriority(which: PriorityWhichType, who: u32, vm: &VirtualMachine) -> PyResult {
+        Errno::clear();
+        let retval = unsafe { libc::getpriority(which, who) };
+        if errno() != 0 {
+            Err(errno_err(vm))
+        } else {
+            Ok(vm.ctx.new_int(retval))
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[pyfunction]
+    fn setpriority(
+        which: PriorityWhichType,
+        who: u32,
+        priority: i32,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let retval = unsafe { libc::setpriority(which, who, priority) };
+        if retval == -1 {
+            Err(errno_err(vm))
+        } else {
+            Ok(())
+        }
+    }
 }
 #[cfg(unix)]
 use posix as platform;
@@ -2400,26 +2666,6 @@ mod nt {
         }
     }
 
-    // Copied from CPython fileutils.c
-    fn attributes_to_mode(attr: u32) -> u32 {
-        const FILE_ATTRIBUTE_DIRECTORY: u32 = 16;
-        const FILE_ATTRIBUTE_READONLY: u32 = 1;
-        const S_IFDIR: u32 = 0o040000;
-        const S_IFREG: u32 = 0o100000;
-        let mut m: u32 = 0;
-        if attr & FILE_ATTRIBUTE_DIRECTORY == FILE_ATTRIBUTE_DIRECTORY {
-            m |= S_IFDIR | 0o111; /* IFEXEC for user,group,other */
-        } else {
-            m |= S_IFREG;
-        }
-        if attr & FILE_ATTRIBUTE_READONLY == FILE_ATTRIBUTE_READONLY {
-            m |= 0o444;
-        } else {
-            m |= 0o666;
-        }
-        m
-    }
-
     #[pyattr]
     fn environ(vm: &VirtualMachine) -> PyDictRef {
         let environ = vm.ctx.new_dict();
@@ -2433,44 +2679,6 @@ mod nt {
     }
 
     #[pyfunction]
-    pub(super) fn stat(
-        file: Either<PyPathLike, i64>,
-        _dir_fd: DirFd, // TODO: error
-        follow_symlinks: FollowSymlinks,
-        vm: &VirtualMachine,
-    ) -> PyResult {
-        use std::os::windows::fs::MetadataExt;
-
-        let get_stats = move || -> io::Result<PyObjectRef> {
-            let meta = match file {
-                Either::A(path) => fs_metadata(path.path, follow_symlinks.follow_symlinks)?,
-                Either::B(fno) => {
-                    let f = rust_file(fno);
-                    let meta = f.metadata()?;
-                    raw_file_number(f);
-                    meta
-                }
-            };
-
-            Ok(super::_os::StatResult {
-                st_mode: attributes_to_mode(meta.file_attributes()),
-                st_ino: 0,   // TODO: Not implemented in std::os::windows::fs::MetadataExt.
-                st_dev: 0,   // TODO: Not implemented in std::os::windows::fs::MetadataExt.
-                st_nlink: 0, // TODO: Not implemented in std::os::windows::fs::MetadataExt.
-                st_uid: 0,   // 0 on windows
-                st_gid: 0,   // 0 on windows
-                st_size: meta.file_size(),
-                st_atime: to_seconds_from_unix_epoch(meta.accessed()?),
-                st_mtime: to_seconds_from_unix_epoch(meta.modified()?),
-                st_ctime: to_seconds_from_unix_epoch(meta.created()?),
-            }
-            .into_obj(vm))
-        };
-
-        get_stats().map_err(|err| err.into_pyexception(vm))
-    }
-
-    #[pyfunction]
     fn chmod(
         path: PyPathLike,
         dir_fd: DirFd,
@@ -2480,7 +2688,7 @@ mod nt {
     ) -> PyResult<()> {
         const S_IWRITE: u32 = 128;
         let path = make_path(vm, &path, &dir_fd)?;
-        let metadata = if follow_symlinks.follow_symlinks {
+        let metadata = if follow_symlinks.0 {
             fs::metadata(path)
         } else {
             fs::symlink_metadata(path)
@@ -2693,16 +2901,6 @@ mod minor {
     #[pyfunction]
     pub(super) fn access(_path: PyStrRef, _mode: u8, vm: &VirtualMachine) -> PyResult<bool> {
         os_unimpl("os.access", vm)
-    }
-
-    #[pyfunction]
-    pub(super) fn stat(
-        _file: Either<PyPathLike, i64>,
-        _dir_fd: DirFd,
-        _follow_symlinks: FollowSymlinks,
-        vm: &VirtualMachine,
-    ) -> PyResult {
-        os_unimpl("os.stat", vm)
     }
 
     #[pyfunction]

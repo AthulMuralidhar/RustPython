@@ -206,9 +206,7 @@ mod decl {
 
     #[pyfunction]
     fn divmod(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        vm.call_or_reflection(&a, &b, "__divmod__", "__rdivmod__", |vm, a, b| {
-            Err(vm.new_unsupported_binop_error(a, b, "divmod"))
-        })
+        vm._divmod(&a, &b)
     }
 
     #[cfg(feature = "rustpython-compiler")]
@@ -594,15 +592,25 @@ mod decl {
         }
     }
 
+    #[derive(FromArgs)]
+    struct PowArgs {
+        #[pyarg(any)]
+        base: PyObjectRef,
+        #[pyarg(any)]
+        exp: PyObjectRef,
+        #[pyarg(any, optional, name = "mod")]
+        modulus: Option<PyObjectRef>,
+    }
+
     #[allow(clippy::suspicious_else_formatting)]
     #[pyfunction]
-    fn pow(
-        x: PyObjectRef,
-        y: PyObjectRef,
-        mod_value: OptionalOption<PyObjectRef>,
-        vm: &VirtualMachine,
-    ) -> PyResult {
-        match mod_value.flatten() {
+    fn pow(args: PowArgs, vm: &VirtualMachine) -> PyResult {
+        let PowArgs {
+            base: x,
+            exp: y,
+            modulus,
+        } = args;
+        match modulus {
             None => vm.call_or_reflection(&x, &y, "__pow__", "__rpow__", |vm, x, y| {
                 Err(vm.new_unsupported_binop_error(x, y, "pow"))
             }),
@@ -938,6 +946,7 @@ pub fn make_module(vm: &VirtualMachine, module: PyObjectRef) {
         "OSError" => ctx.exceptions.os_error.clone(),
         // OSError alias
         "IOError" => ctx.exceptions.os_error.clone(),
+        "EnvironmentError" => ctx.exceptions.os_error.clone(),
         "BlockingIOError" => ctx.exceptions.blocking_io_error.clone(),
         "ChildProcessError" => ctx.exceptions.child_process_error.clone(),
         "ConnectionError" => ctx.exceptions.connection_error.clone(),

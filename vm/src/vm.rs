@@ -181,6 +181,10 @@ pub struct PySettings {
 
     /// PYTHONHASHSEED=x
     pub hash_seed: Option<u32>,
+
+    /// -u, PYTHONUNBUFFERED=x
+    // TODO: use this; can TextIOWrapper even work with a non-buffered?
+    pub stdio_unbuffered: bool,
 }
 
 /// Trace events for sys.settrace and sys.setprofile.
@@ -221,6 +225,7 @@ impl Default for PySettings {
             path_list: vec![],
             argv: vec![],
             hash_seed: None,
+            stdio_unbuffered: false,
         }
     }
 }
@@ -282,7 +287,7 @@ impl VirtualMachine {
             initialized: false,
         };
 
-        let frozen = frozen::get_module_inits(&vm);
+        let frozen = frozen::map_frozen(&vm, frozen::get_module_inits()).collect();
         PyRc::get_mut(&mut vm.state).unwrap().frozen = frozen;
 
         module::init_module_dict(
@@ -1466,6 +1471,12 @@ impl VirtualMachine {
             vm.call_or_reflection(a, b, "__mod__", "__rmod__", |vm, a, b| {
                 Err(vm.new_unsupported_binop_error(a, b, "%="))
             })
+        })
+    }
+
+    pub fn _divmod(&self, a: &PyObjectRef, b: &PyObjectRef) -> PyResult {
+        self.call_or_reflection(a, b, "__divmod__", "__rdivmod__", |vm, a, b| {
+            Err(vm.new_unsupported_binop_error(a, b, "divmod"))
         })
     }
 

@@ -40,6 +40,12 @@ impl StoredVirtualMachine {
                 setup_browser_module(vm);
             }
 
+            VM_INIT_FUNCS.with(|cell| {
+                for f in cell.borrow().iter() {
+                    f(vm)
+                }
+            });
+
             scope = Some(vm.new_scope_with_builtins());
 
             InitParameter::Internal
@@ -53,11 +59,18 @@ impl StoredVirtualMachine {
     }
 }
 
+/// Add a hook to add builtins or frozen modules to the RustPython VirtualMachine while it's
+/// initializing.
+pub fn add_init_func(f: fn(&mut VirtualMachine)) {
+    VM_INIT_FUNCS.with(|cell| cell.borrow_mut().push(f))
+}
+
 // It's fine that it's thread local, since WASM doesn't even have threads yet. thread_local!
 // probably gets compiled down to a normal-ish static varible, like Atomic* types do:
 // https://rustwasm.github.io/2018/10/24/multithreading-rust-and-wasm.html#atomic-instructions
 thread_local! {
     static STORED_VMS: RefCell<HashMap<String, Rc<StoredVirtualMachine>>> = RefCell::default();
+    static VM_INIT_FUNCS: RefCell<Vec<fn(&mut VirtualMachine)>> = RefCell::default();
 }
 
 pub fn get_vm_id(vm: &VirtualMachine) -> &str {
@@ -203,7 +216,7 @@ impl WASMVirtualMachine {
     pub fn add_to_scope(&self, name: String, value: JsValue) -> Result<(), JsValue> {
         self.with_vm(move |vm, StoredVirtualMachine { ref scope, .. }| {
             let value = convert::js_to_py(vm, value);
-            scope.globals.set_item(name, value, vm).to_js(vm)
+            scope.globals.set_item(name, value, vm).into_js(vm)
         })?
     }
 
@@ -252,7 +265,7 @@ impl WASMVirtualMachine {
             let attrs = vm.ctx.new_dict();
             attrs
                 .set_item("__name__", vm.ctx.new_str(name.clone()), vm)
-                .to_js(vm)?;
+                .into_js(vm)?;
 
             if let Some(imports) = imports {
                 for entry in convert::object_entries(&imports) {
@@ -260,19 +273,19 @@ impl WASMVirtualMachine {
                     let key: String = Object::from(key).to_string().into();
                     attrs
                         .set_item(key.as_str(), convert::js_to_py(vm, value), vm)
-                        .to_js(vm)?;
+                        .into_js(vm)?;
                 }
             }
 
             vm.run_code_obj(code, Scope::new(None, attrs.clone()))
-                .to_js(vm)?;
+                .into_js(vm)?;
 
             let module = vm.new_module(&name, attrs);
 
             let sys_modules = vm
                 .get_attribute(vm.sys_module.clone(), "modules")
-                .to_js(vm)?;
-            sys_modules.set_item(name, module, vm).to_js(vm)?;
+                .into_js(vm)?;
+            sys_modules.set_item(name, module, vm).into_js(vm)?;
 
             Ok(())
         })?
@@ -292,8 +305,8 @@ impl WASMVirtualMachine {
 
             let sys_modules = vm
                 .get_attribute(vm.sys_module.clone(), "modules")
-                .to_js(vm)?;
-            sys_modules.set_item(name, py_module, vm).to_js(vm)?;
+                .into_js(vm)?;
+            sys_modules.set_item(name, py_module, vm).into_js(vm)?;
 
             Ok(())
         })?

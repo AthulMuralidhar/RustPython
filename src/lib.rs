@@ -36,7 +36,7 @@
 //!
 //! The binary will have all the standard arguments of a python interpreter (including a REPL!) but
 //! it will have your modules loaded into the vm.
-#![allow(clippy::needless_doctest_main)]
+#![allow(clippy::needless_doctest_main, clippy::unnecessary_wraps)]
 
 #[macro_use]
 extern crate clap;
@@ -276,6 +276,13 @@ fn parse_arguments<'a>(app: App<'a, '_>) -> ArgMatches<'a> {
                 .short("b")
                 .multiple(true)
                 .help("issue warnings about using bytes where strings are usually expected (-bb: issue errors)"),
+        ).arg(
+            Arg::with_name("unbuffered")
+                .short("u")
+                .help(
+                    "force the stdout and stderr streams to be unbuffered; \
+                        this option has no effect on stdin; also PYTHONUNBUFFERED=x",
+                ),
         );
     #[cfg(feature = "flame-it")]
     let app = app
