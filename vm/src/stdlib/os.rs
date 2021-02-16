@@ -2466,6 +2466,20 @@ mod posix {
         })
     }
 
+    extern "C" {
+        fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
+    }
+    #[pyfunction]
+    fn _ctermid(vm: &VirtualMachine) -> PyResult{
+        let returned = unsafe { ctermid(std::ptr::null_mut()) };
+        if returned.is_null(){
+            Err(errno_err(vm))
+        } else {
+            let ret = unsafe { ffi::CStr::from_ptr(ret) }.to_str().unwrap();
+            Ok(vm.ctx.new_str(name))
+        }
+    }
+
     pub(super) fn support_funcs(vm: &VirtualMachine) -> Vec<SupportFunc> {
         vec![
             SupportFunc::new(vm, "chmod", chmod, Some(false), Some(false), Some(false)),
@@ -2859,6 +2873,7 @@ mod nt {
             Ok(())
         }
     }
+
 
     pub(super) fn support_funcs(_vm: &VirtualMachine) -> Vec<SupportFunc> {
         Vec::new()
