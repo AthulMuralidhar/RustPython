@@ -2470,9 +2470,9 @@ mod posix {
         fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
     }
     #[pyfunction]
-    fn _ctermid(vm: &VirtualMachine) -> PyResult{
+    fn _ctermid(vm: &VirtualMachine) -> PyResult {
         let returned = unsafe { ctermid(std::ptr::null_mut()) };
-        if returned.is_null(){
+        if returned.is_null() {
             Err(errno_err(vm))
         } else {
             let returned = unsafe { ffi::CStr::from_ptr(returned) }.to_str().unwrap();
@@ -2873,7 +2873,6 @@ mod nt {
             Ok(())
         }
     }
-
 
     pub(super) fn support_funcs(_vm: &VirtualMachine) -> Vec<SupportFunc> {
         Vec::new()
