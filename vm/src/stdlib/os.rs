@@ -2475,8 +2475,8 @@ mod posix {
         if returned.is_null(){
             Err(errno_err(vm))
         } else {
-            let ret = unsafe { ffi::CStr::from_ptr(ret) }.to_str().unwrap();
-            Ok(vm.ctx.new_str(name))
+            let returned = unsafe { ffi::CStr::from_ptr(returned) }.to_str().unwrap();
+            Ok(vm.ctx.new_str(returned))
         }
     }
 
