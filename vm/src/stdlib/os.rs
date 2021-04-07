@@ -2482,11 +2482,6 @@ mod posix {
 
     #[pyfunction]
     // fchdir is the same as os.chdir(file descriptor)
-    // 1. have a file desriptor that repsresents a directory
-    // 2. pass this fd to the fchdir function
-    // 3. check if the fd is a directory or not
-    // 4. if its a dirrectory, then proceed to chage current directory to the fd's path
-
     // also check out: https://docs.rs/libc/0.2.86/libc/fn.fchdir.html
     fn fchchdir(path: PyPathLike, vm: &VirtualMachine) -> PyResult<()> {
         env::set_current_dir(&path.path).map_err(|err| err.into_pyexception(vm))
