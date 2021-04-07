@@ -37,7 +37,7 @@ pub struct CodeInfo {
 
     pub blocks: Vec<Block>,
     pub current_block: BlockIdx,
-    pub constants: Vec<ConstantData>,
+    pub constants: IndexSet<ConstantData>,
     pub name_cache: IndexSet<String>,
     pub varname_cache: IndexSet<String>,
     pub cellvar_cache: IndexSet<String>,
@@ -104,7 +104,7 @@ impl CodeInfo {
             max_stacksize,
             instructions: instructions.into_boxed_slice(),
             locations: locations.into_boxed_slice(),
-            constants: constants.into(),
+            constants: constants.into_iter().collect(),
             names: name_cache.into_iter().collect(),
             varnames: varname_cache.into_iter().collect(),
             cellvars: cellvar_cache.into_iter().collect(),
@@ -167,25 +167,29 @@ impl CodeInfo {
         let mut startdepths = vec![u32::MAX; self.blocks.len()];
         startdepths[0] = 0;
         stack.push(Label(0));
+        let debug = false;
         'process_blocks: while let Some(block) = stack.pop() {
             let mut depth = startdepths[block.0 as usize];
+            if debug {
+                eprintln!("===BLOCK {}===", block.0);
+            }
             let block = &self.blocks[block.0 as usize];
             for i in &block.instructions {
                 let instr = &i.instr;
                 let effect = instr.stack_effect(false);
                 let new_depth = add_ui(depth, effect);
+                if debug {
+                    eprintln!("{:?}: {:+}, {:+} = {}", instr, effect, depth, new_depth);
+                }
                 if new_depth > maxdepth {
                     maxdepth = new_depth
                 }
-                // we don't want to worry about Continue or Break, they use unwinding to jump to
-                // their targets and as such the stack size is taken care of in frame.rs by setting
+                // we don't want to worry about Continue, it uses unwinding to jump to
+                // its targets and as such the stack size is taken care of in frame.rs by setting
                 // it back to the level it was at when SetupLoop was run
-                let jump_label = instr.label_arg().filter(|_| {
-                    !matches!(
-                        instr,
-                        Instruction::Continue { .. } | Instruction::Break { .. }
-                    )
-                });
+                let jump_label = instr
+                    .label_arg()
+                    .filter(|_| !matches!(instr, Instruction::Continue { .. }));
                 if let Some(&target_block) = jump_label {
                     let effect = instr.stack_effect(true);
                     let target_depth = add_ui(depth, effect);
@@ -215,7 +219,7 @@ fn stackdepth_push(stack: &mut Vec<Label>, startdepths: &mut [u32], target: Labe
 
 fn add_ui(a: u32, b: i32) -> u32 {
     if b < 0 {
-        a - b.abs() as u32
+        a - b.wrapping_abs() as u32
     } else {
         a + b as u32
     }

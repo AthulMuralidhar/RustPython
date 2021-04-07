@@ -137,7 +137,7 @@ pub fn py_to_js(vm: &VirtualMachine, py_obj: PyObjectRef) -> JsValue {
     // the browser module might not be injected
     if vm.try_class("_js", "Promise").is_ok() {
         if let Some(py_prom) = py_obj.payload::<js_module::PyPromise>() {
-            return py_prom.value().into();
+            return py_prom.as_js(vm).into();
         }
     }
 
@@ -255,7 +255,7 @@ pub fn syntax_err(err: CompileError) -> SyntaxError {
         &"col".into(),
         &(err.location.column() as u32).into(),
     );
-    let can_continue = matches!(&err.error, CompileErrorType::Parse(ParseErrorType::EOF));
+    let can_continue = matches!(&err.error, CompileErrorType::Parse(ParseErrorType::Eof));
     let _ = Reflect::set(&js_err, &"canContinue".into(), &can_continue.into());
     js_err
 }

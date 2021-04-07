@@ -307,7 +307,7 @@ impl Drop for PyObjectRef {
         // CPython-compatible drop implementation
         let zelf = self.clone();
         if let Some(del_slot) = self.class().mro_find_map(|cls| cls.slots.del.load()) {
-            crate::vm::thread::with_vm(&zelf, |vm| {
+            let ret = crate::vm::thread::with_vm(&zelf, |vm| {
                 if let Err(e) = del_slot(&zelf, vm) {
                     // exception in del will be ignored but printed
                     print!("Exception ignored in: ",);
@@ -327,6 +327,9 @@ impl Drop for PyObjectRef {
                     }
                 }
             });
+            if ret.is_none() {
+                warn!("couldn't run __del__ method for object")
+            }
         }
 
         // __del__ might have resurrected the object at this point, but that's fine,
@@ -357,12 +360,17 @@ impl fmt::Debug for PyObjectWeak {
 /// A `PyRef<T>` can be directly returned from a built-in function to handle
 /// situations (such as when implementing in-place methods such as `__iadd__`)
 /// where a reference to the same object must be returned.
-#[derive(Debug)]
 #[repr(transparent)]
 pub struct PyRef<T: PyObjectPayload> {
     // invariant: this obj must always have payload of type T
     obj: PyObjectRef,
     _payload: PhantomData<PyRc<T>>,
+}
+
+impl<T: PyObjectPayload> fmt::Debug for PyRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.obj.fmt(f)
+    }
 }
 
 impl<T: PyObjectPayload> Clone for PyRef<T> {

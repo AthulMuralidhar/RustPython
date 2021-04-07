@@ -13,8 +13,13 @@ use result_like::impl_option_like;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
 
-pub trait IntoFuncArgs {
+pub trait IntoFuncArgs: Sized {
     fn into_args(self, vm: &VirtualMachine) -> FuncArgs;
+    fn into_method_args(self, obj: PyObjectRef, vm: &VirtualMachine) -> FuncArgs {
+        let mut args = self.into_args(vm);
+        args.prepend_arg(obj);
+        args
+    }
 }
 
 impl<T> IntoFuncArgs for T
@@ -38,6 +43,12 @@ macro_rules! into_func_args_from_tuple {
             fn into_args(self, vm: &VirtualMachine) -> FuncArgs {
                 let ($($n,)*) = self;
                 vec![$($n.into_pyobject(vm),)*].into()
+            }
+
+            #[inline]
+            fn into_method_args(self, obj: PyObjectRef, vm: &VirtualMachine) -> FuncArgs {
+                let ($($n,)*) = self;
+                vec![obj, $($n.into_pyobject(vm),)*].into()
             }
         }
     };

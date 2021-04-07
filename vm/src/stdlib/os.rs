@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 use std::{env, fs};
 
 use crossbeam_utils::atomic::AtomicCell;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use filepath::FilePath;
 use num_bigint::BigInt;
 
 use super::errno::errors;
@@ -157,16 +159,41 @@ impl TryFromObject for PyPathLike {
     }
 }
 
+fn path_from_fd(raw_fd: i64) -> Result<PathBuf, String> {
+    cfg_if::cfg_if! {
+        if #[cfg(any(target_os = "linux", target_os = "macos", windows))] {
+            let file = rust_file(raw_fd);
+            let path = match file.path() {
+                Ok(path) => path,
+                Err(e) => {
+                    return Err(format!("{:?} Cannot determine path of fd: {:?}", e, raw_fd));
+                }
+            };
+            raw_file_number(file);  // Do not consume `raw_fd`
+            Ok(path)
+        } else {
+            Err("fd not supported on wasi yet".to_owned());
+        }
+    }
+}
+
 fn make_path<'a>(
     vm: &VirtualMachine,
     path: &'a PyPathLike,
     dir_fd: &DirFd,
-) -> PyResult<&'a ffi::OsStr> {
-    if dir_fd.0.is_some() {
-        Err(vm.new_os_error("dir_fd not supported yet".to_owned()))
-    } else {
-        Ok(path.path.as_os_str())
+) -> PyResult<std::borrow::Cow<'a, ffi::OsStr>> {
+    let path = &path.path;
+    if dir_fd.0.is_none() || path.is_absolute() {
+        return Ok(path.as_os_str().into());
     }
+    let dir_path = match path_from_fd(dir_fd.0.unwrap().into()) {
+        Ok(path) => path,
+        Err(e) => {
+            return Err(vm.new_os_error(e));
+        }
+    };
+    let p: PathBuf = vec![dir_path, path.to_path_buf()].iter().collect();
+    Ok(p.into_os_string().into())
 }
 
 impl IntoPyException for io::Error {
@@ -309,7 +336,7 @@ mod _os {
         O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
         SEEK_SET,
     };
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(windows, target_os = "wasi")))]
     #[pyattr]
     use libc::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
     #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "linux"))]
@@ -332,6 +359,13 @@ mod _os {
         rust_file(fileno);
     }
 
+    #[pyfunction]
+    fn closerange(fd_low: i64, fd_high: i64) {
+        for fileno in fd_low..fd_high {
+            close(fileno);
+        }
+    }
+
     #[cfg(any(unix, windows, target_os = "wasi"))]
     #[pyfunction]
     pub(crate) fn open(
@@ -342,7 +376,7 @@ mod _os {
         vm: &VirtualMachine,
     ) -> PyResult<i64> {
         let fname = make_path(vm, &name, &dir_fd)?;
-        if osstr_contains_nul(fname) {
+        if osstr_contains_nul(&fname) {
             return Err(vm.new_value_error("embedded null character".to_owned()));
         }
 
@@ -497,14 +531,14 @@ mod _os {
     fn remove(path: PyPathLike, dir_fd: DirFd, vm: &VirtualMachine) -> PyResult<()> {
         let path = make_path(vm, &path, &dir_fd)?;
         let is_junction = cfg!(windows)
-            && fs::symlink_metadata(path).map_or(false, |meta| {
+            && fs::symlink_metadata(&path).map_or(false, |meta| {
                 let ty = meta.file_type();
                 ty.is_dir() && ty.is_symlink()
             });
         let res = if is_junction {
-            fs::remove_dir(path)
+            fs::remove_dir(&path)
         } else {
-            fs::remove_file(path)
+            fs::remove_file(&path)
         };
         res.map_err(|err| err.into_pyexception(vm))
     }
@@ -532,8 +566,17 @@ mod _os {
     }
 
     #[pyfunction]
-    fn listdir(path: PyPathLike, vm: &VirtualMachine) -> PyResult {
-        let dir_iter = fs::read_dir(&path.path).map_err(|err| err.into_pyexception(vm))?;
+    fn listdir(path: Either<PyPathLike, i64>, vm: &VirtualMachine) -> PyResult {
+        let path = match path {
+            Either::A(path) => path,
+            Either::B(fno) => match path_from_fd(fno) {
+                Ok(path) => PyPathLike::new_str(path.to_string_lossy().to_string()),
+                Err(e) => {
+                    return Err(vm.new_os_error(e));
+                }
+            },
+        };
+        let dir_iter = fs::read_dir(&path).map_err(|err| err.into_pyexception(vm))?;
         let res: PyResult<Vec<PyObjectRef>> = dir_iter
             .map(|entry| match entry {
                 Ok(entry_path) => path.mode.process_path(entry_path.file_name(), vm),
@@ -784,6 +827,8 @@ mod _os {
             {
                 #[cfg(target_os = "android")]
                 use std::os::android::fs::MetadataExt;
+                #[cfg(target_os = "freebsd")]
+                use std::os::freebsd::fs::MetadataExt;
                 #[cfg(target_os = "linux")]
                 use std::os::linux::fs::MetadataExt;
                 #[cfg(target_os = "macos")]
@@ -875,7 +920,7 @@ mod _os {
     #[pyfunction]
     fn stat(
         file: Either<PyPathLike, i64>,
-        dir_fd: super::DirFd,
+        dir_fd: DirFd,
         follow_symlinks: FollowSymlinks,
         vm: &VirtualMachine,
     ) -> PyResult {
@@ -1212,7 +1257,7 @@ mod _os {
     pub(super) fn support_funcs(vm: &VirtualMachine) -> Vec<SupportFunc> {
         let mut supports = super::platform::support_funcs(vm);
         supports.extend(vec![
-            SupportFunc::new(vm, "open", open, None, Some(false), None),
+            SupportFunc::new(vm, "open", open, None, Some(true), None),
             SupportFunc::new(
                 vm,
                 "access",
@@ -1223,7 +1268,7 @@ mod _os {
             ),
             SupportFunc::new(vm, "chdir", chdir, Some(false), None, None),
             // chflags Some, None Some
-            SupportFunc::new(vm, "listdir", listdir, Some(false), None, None),
+            SupportFunc::new(vm, "listdir", listdir, Some(true), None, None),
             SupportFunc::new(vm, "mkdir", mkdir, Some(false), Some(false), None),
             // mkfifo Some Some None
             // mknod Some Some None
@@ -1234,8 +1279,8 @@ mod _os {
             SupportFunc::new(vm, "replace", rename, Some(false), Some(false), None), // TODO: Fix replace
             SupportFunc::new(vm, "rmdir", rmdir, Some(false), Some(false), None),
             SupportFunc::new(vm, "scandir", scandir, Some(false), None, None),
-            SupportFunc::new(vm, "stat", stat, Some(false), Some(false), Some(false)),
-            SupportFunc::new(vm, "fstat", stat, Some(false), Some(false), Some(false)),
+            SupportFunc::new(vm, "stat", stat, Some(true), Some(true), Some(true)),
+            SupportFunc::new(vm, "fstat", stat, Some(true), Some(true), Some(true)),
             SupportFunc::new(vm, "symlink", platform::symlink, None, Some(false), None),
             // truncate Some None None
             SupportFunc::new(vm, "unlink", remove, Some(false), Some(false), None),
@@ -1368,11 +1413,14 @@ mod posix {
     pub(super) use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::RawFd;
 
+    #[cfg(not(any(target_os = "redox", target_os = "freebsd")))]
+    #[pyattr]
+    use libc::O_DSYNC;
     #[pyattr]
     use libc::{O_CLOEXEC, O_NONBLOCK, WNOHANG};
     #[cfg(not(target_os = "redox"))]
     #[pyattr]
-    use libc::{O_DSYNC, O_NDELAY, O_NOCTTY};
+    use libc::{O_NDELAY, O_NOCTTY};
 
     #[pyattr]
     const EX_OK: i8 = exitcode::OK as i8;
@@ -1499,7 +1547,7 @@ mod posix {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn getgroups() -> nix::Result<Vec<Gid>> {
         use libc::{c_int, gid_t};
         use std::ptr;
@@ -1518,7 +1566,7 @@ mod posix {
         })
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "redox")))]
     use nix::unistd::getgroups;
 
     #[cfg(target_os = "redox")]
@@ -1788,10 +1836,10 @@ mod posix {
         let path = make_path(vm, &path, &dir_fd)?;
         let body = move || {
             use std::os::unix::fs::PermissionsExt;
-            let meta = fs_metadata(path, follow_symlinks.0)?;
+            let meta = fs_metadata(&path, follow_symlinks.0)?;
             let mut permissions = meta.permissions();
             permissions.set_mode(mode);
-            fs::set_permissions(path, permissions)
+            fs::set_permissions(&path, permissions)
         };
         body().map_err(|err| err.into_pyexception(vm))
     }
@@ -2000,26 +2048,9 @@ mod posix {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
-    type ModeT = u32;
-
-    #[cfg(target_os = "redox")]
-    type ModeT = i32;
-
-    #[cfg(target_os = "macos")]
-    type ModeT = u16;
-
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "openbsd",
-        target_os = "redox",
-        target_os = "android",
-    ))]
     #[pyfunction]
-    fn umask(mask: ModeT, _vm: &VirtualMachine) -> PyResult<ModeT> {
-        let ret_mask = unsafe { libc::umask(mask) };
-        Ok(ret_mask)
+    fn umask(mask: libc::mode_t) -> libc::mode_t {
+        unsafe { libc::umask(mask) }
     }
 
     #[pyattr]
@@ -2062,12 +2093,7 @@ mod posix {
     }
 
     // cfg from nix
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "openbsd"
-    ))]
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
     #[pyfunction]
     fn getresuid(vm: &VirtualMachine) -> PyResult<(u32, u32, u32)> {
         let mut ruid = 0;
@@ -2082,12 +2108,7 @@ mod posix {
     }
 
     // cfg from nix
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "openbsd"
-    ))]
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
     #[pyfunction]
     fn getresgid(vm: &VirtualMachine) -> PyResult<(u32, u32, u32)> {
         let mut rgid = 0;
@@ -2119,12 +2140,7 @@ mod posix {
     }
 
     // cfg from nix
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "openbsd"
-    ))]
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
     #[pyfunction]
     fn setregid(rgid: u32, egid: u32, vm: &VirtualMachine) -> PyResult<()> {
         let ret = unsafe { libc::setregid(rgid, egid) };
@@ -2150,12 +2166,7 @@ mod posix {
     }
 
     // cfg from nix
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "openbsd"
-    ))]
+    #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "redox")))]
     #[pyfunction]
     fn setgroups(group_ids: PyIterable<u32>, vm: &VirtualMachine) -> PyResult<()> {
         let gids = group_ids
@@ -2533,10 +2544,21 @@ mod posix {
             type PriorityWhichType = libc::c_int;
         }
     }
+    cfg_if::cfg_if! {
+        if #[cfg(target_os = "freebsd")] {
+            type PriorityWhoType = i32;
+        } else {
+            type PriorityWhoType = u32;
+        }
+    }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(windows, target_os = "redox")))]
     #[pyfunction]
-    fn getpriority(which: PriorityWhichType, who: u32, vm: &VirtualMachine) -> PyResult {
+    fn getpriority(
+        which: PriorityWhichType,
+        who: PriorityWhoType,
+        vm: &VirtualMachine,
+    ) -> PyResult {
         Errno::clear();
         let retval = unsafe { libc::getpriority(which, who) };
         if errno() != 0 {
@@ -2546,11 +2568,11 @@ mod posix {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(windows, target_os = "redox")))]
     #[pyfunction]
     fn setpriority(
         which: PriorityWhichType,
-        who: u32,
+        who: PriorityWhoType,
         priority: i32,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
@@ -2689,14 +2711,14 @@ mod nt {
         const S_IWRITE: u32 = 128;
         let path = make_path(vm, &path, &dir_fd)?;
         let metadata = if follow_symlinks.0 {
-            fs::metadata(path)
+            fs::metadata(&path)
         } else {
-            fs::symlink_metadata(path)
+            fs::symlink_metadata(&path)
         };
         let meta = metadata.map_err(|err| err.into_pyexception(vm))?;
         let mut permissions = meta.permissions();
         permissions.set_readonly(mode & S_IWRITE != 0);
-        fs::set_permissions(path, permissions).map_err(|err| err.into_pyexception(vm))
+        fs::set_permissions(&path, permissions).map_err(|err| err.into_pyexception(vm))
     }
 
     // cwait is available on MSVC only (according to CPython)

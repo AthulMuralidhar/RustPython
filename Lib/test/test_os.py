@@ -159,8 +159,6 @@ class FileTests(unittest.TestCase):
         os.close(f)
         self.assertTrue(os.access(support.TESTFN, os.W_OK))
 
-    # TODO: RUSTPYTHON (AttributeError: module 'os' has no attribute 'dup')
-    @unittest.expectedFailure
     def test_closerange(self):
         first = os.open(support.TESTFN, os.O_CREAT|os.O_RDWR)
         # We must allocate two consecutive file descriptors, otherwise
@@ -1625,8 +1623,6 @@ class URandomFDTests(unittest.TestCase):
             """
         assert_python_ok('-c', code)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_urandom_fd_closed(self):
         # Issue #21207: urandom() should reopen its fd to /dev/urandom if
         # closed.
@@ -1641,8 +1637,6 @@ class URandomFDTests(unittest.TestCase):
             """
         rc, out, err = assert_python_ok('-Sc', code)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_urandom_fd_reopened(self):
         # Issue #21207: urandom() should detect its fd to /dev/urandom
         # changed to something else, and reopen it.
@@ -3964,8 +3958,9 @@ class TestScandir(unittest.TestCase):
             self.assertIs(type(entry.name), bytes)
             self.assertIs(type(entry.path), bytes)
 
-    @unittest.skipUnless(os.listdir in os.supports_fd,
-                         'fd support for listdir required for this test.')
+    # TODO: RUSTPYTHON (scandir needs to have supports_fd)
+    @unittest.skipUnless(os.scandir in os.supports_fd,
+                         'fd support for scandir required for this test.')
     def test_fd(self):
         self.assertIn(os.scandir, os.supports_fd)
         self.create_file('file.txt')
